@@ -1,30 +1,34 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
-  Activity, ArrowDownLeft, ArrowLeftRight, ArrowUpRight, Bell, CalendarDays, Check, ChevronDown, ChevronLeft,
-  ChevronRight, CreditCard, Ellipsis, Filter, LayoutDashboard, Leaf, LogOut, Menu,
-  MoreHorizontal, Plus, Search, Settings, ShieldCheck, SlidersHorizontal, Sparkles, Tag, Trash2, Users,
-  Wallet, X, type LucideIcon,
+  Activity, ArrowDownLeft, ArrowLeftRight, ArrowUpRight, Bell, Check, ChevronLeft,
+  ChevronRight, FileDown, Filter, Leaf, LogOut, Menu,
+  MoreHorizontal, Plus, Search, Settings, ShieldCheck, SlidersHorizontal, Tag, Trash2, Users,
+  X, Repeat2,
 } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
 import Auth from "./Auth";
+import { navigation } from "./app/navigation";
+import { Card, Empty, Field, PageHeading } from "./components/ui/FinancePrimitives";
+import Modal from "./components/ui/Modal";
+import ReceiptViewerDialog from "./features/transactions/ReceiptViewerDialog";
+import TransactionActionsMenu from "./features/transactions/TransactionActionsMenu";
+import PlanningPage from "./features/planning/PlanningPage";
+import CashflowCalendarPage from "./features/cashflow/CashflowCalendarPage";
+import BudgetsPage from "./features/budgets/BudgetsPage";
+import VaultPage from "./features/vault/VaultPage";
+import SettingsPage from "./features/settings/SettingsPage";
+import { makeAnalyticsTrend, Metric, Overview, TransactionRow } from "./features/overview/Overview";
 import { isSupabaseConfigured, supabase } from "./lib/supabase";
-import { amountInMinorUnits, budgetProgress, categorySpending, dateInTimezone, formatCurrency, monthBounds, splitAmount, sumByType, sumMoneyAmounts, transactionsInMonth } from "./lib/finance";
-import type { Budget, Category, ExpenseSplit, Group, GroupInvitation, GroupMember, PageKey, PaymentMethod, PaymentSource, PaymentSourceKind, Profile, Settlement, SharedExpense, Transaction, TransactionType } from "./types";
+import { amountInMinorUnits, categorySpending, dateInTimezone, formatCurrency, monthBounds, splitAmount, sumByType, sumMoneyAmounts, transactionsInMonth } from "./lib/finance";
+import type { Budget, Category, ExpenseSplit, Group, GroupInvitation, GroupMember, PageKey, PaymentMethod, PaymentSource, Profile, RecurringPayment, Settlement, SharedExpense, Transaction, TransactionPaymentMethod, TransactionType, UserNotification } from "./types";
 
-const navigation: { name: PageKey; icon: LucideIcon }[] = [
-  { name: "Overview", icon: LayoutDashboard },
-  { name: "Transactions", icon: ArrowLeftRight },
-  { name: "Budgets", icon: Wallet },
-  { name: "Analytics", icon: Activity },
-  { name: "Shared expenses", icon: Users },
-  { name: "Card Vault", icon: CreditCard },
-  { name: "Settings", icon: Settings },
+const methodLabels: Record<TransactionPaymentMethod, string> = { cash: "Cash", credit_card: "Credit card", debit_card: "Debit card", upi: "UPI", shared: "Shared split" };
+const paymentOptions: [PaymentMethod, string][] = [
+  ["cash", "Cash"], ["credit_card", "Credit card"], ["debit_card", "Debit card"], ["upi", "UPI"],
 ];
-
-const methodLabels: Record<PaymentMethod, string> = { cash: "Cash", credit_card: "Credit card", debit_card: "Debit card", upi: "UPI" };
 
 function formatSupabaseError(error: unknown): string {
   if (typeof error !== "object" || error === null) return "Unknown Supabase error.";
@@ -46,6 +50,40 @@ function dateLabel(value: string, timezone = Intl.DateTimeFormat().resolvedOptio
   return new Intl.DateTimeFormat("en", { month: "short", day: "numeric", year: "numeric", timeZone: timezone }).format(new Date(value));
 }
 
+function downloadCsv(filename: string, rows: (string | number)[][]) {
+  const csvEscape = (value: string | number) => {
+    let text = String(value);
+    if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
+    return `"${text.replaceAll('"', '""')}"`;
+  };
+  const content = `\uFEFF${rows.map((row) => row.map(csvEscape).join(",")).join("\r\n")}`;
+  const url = URL.createObjectURL(new Blob([content], { type: "text/csv;charset=utf-8" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function transactionReportRows(transactions: Transaction[], categories: Category[], sources: PaymentSource[], currency: string, timezone: string): (string | number)[][] {
+  return [
+    ["Date", "Description", "Type", "Category", "Payment method", "Payment source", "Amount", "Currency", "Notes"],
+    ...transactions.map((transaction) => [
+      dateLabel(transaction.occurred_at, timezone),
+      transaction.title,
+      transaction.type,
+      categories.find((category) => category.id === transaction.category_id)?.name ?? "",
+      methodLabels[transaction.payment_method],
+      sources.find((source) => source.id === transaction.payment_source_id)?.label ?? (transaction.shared_expense_id ? "Shared expense" : ""),
+      transaction.amount,
+      currency,
+      transaction.notes ?? "",
+    ]),
+  ];
+}
+
 function App() {
   const [session, setSession] = useState<Awaited<ReturnType<NonNullable<typeof supabase>["auth"]["getSession"]>>["data"]["session"]>(null);
   const [authLoading, setAuthLoading] = useState(Boolean(supabase));
@@ -56,6 +94,8 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState("");
   const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [recurringPayments, setRecurringPayments] = useState<RecurringPayment[]>([]);
+  const [notifications, setNotifications] = useState<UserNotification[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   const [sources, setSources] = useState<PaymentSource[]>([]);
   const [budgets, setBudgets] = useState<Budget[]>([]);
@@ -65,14 +105,18 @@ function App() {
   const [expenses, setExpenses] = useState<SharedExpense[]>([]);
   const [splits, setSplits] = useState<ExpenseSplit[]>([]);
   const [settlements, setSettlements] = useState<Settlement[]>([]);
-  const [toast, setToast] = useState("");
+  const [toasts, setToasts] = useState<{ id: string; message: string }[]>([]);
   const [transactionModal, setTransactionModal] = useState<Transaction | "new" | null>(null);
+  const [transactionDraft, setTransactionDraft] = useState<{ title: string; amount: number; type: TransactionType; category_id: string | null; occurred_at: string } | null>(null);
   const [mobileMenu, setMobileMenu] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const notificationsInitialized = useRef(false);
+  const knownNotificationIds = useRef(new Set<string>());
 
   const notify = useCallback((message: string) => {
-    setToast(message);
-    window.setTimeout(() => setToast(""), 3200);
+    const id = crypto.randomUUID();
+    setToasts((current) => [...current, { id, message }]);
+    window.setTimeout(() => setToasts((current) => current.filter((toast) => toast.id !== id)), 4200);
   }, []);
 
   useEffect(() => {
@@ -92,7 +136,10 @@ function App() {
     const { data: listener } = supabase.auth.onAuthStateChange((event, nextSession) => {
       setSession(nextSession);
       if (event === "PASSWORD_RECOVERY") setRecoveryMode(true);
-      if (!nextSession) { setProfile(null); setProfileLoaded(false); setRecoveryMode(false); }
+      if (!nextSession) {
+        setProfile(null); setProfileLoaded(false); setRecoveryMode(false);
+        setNotifications([]); setRecurringPayments([]); knownNotificationIds.current.clear(); notificationsInitialized.current = false;
+      }
     });
     return () => {
       active = false;
@@ -105,12 +152,14 @@ function App() {
     setLoading(true);
     setLoadError("");
     try {
-      const [profileResult, categoryResult, sourceResult, budgetResult, membershipResult] = await Promise.all([
+      const [profileResult, categoryResult, sourceResult, budgetResult, membershipResult, notificationResult, recurringResult] = await Promise.all([
         supabase.from("profiles").select("*").eq("id", session.user.id).single(),
         supabase.from("categories").select("*").order("name"),
         supabase.from("payment_sources").select("*").order("created_at", { ascending: false }),
         supabase.from("budgets").select("*"),
         supabase.from("group_memberships").select("group_id,user_id,role").eq("user_id", session.user.id),
+        supabase.from("user_notifications").select("*").is("read_at", null).order("created_at", { ascending: false }),
+        supabase.from("recurring_payments").select("*").order("next_due_on", { ascending: true }),
       ]);
       const initialError = profileResult.error
         ? { query: "profiles", error: profileResult.error }
@@ -122,14 +171,29 @@ function App() {
               ? { query: "budgets", error: budgetResult.error }
               : membershipResult.error
                 ? { query: "group_memberships", error: membershipResult.error }
-                : null;
+                : notificationResult.error
+                  ? { query: "user_notifications", error: notificationResult.error }
+                  : recurringResult.error
+                    ? { query: "recurring_payments", error: recurringResult.error }
+                    : null;
       if (initialError) throw new Error(`${initialError.query}: ${formatSupabaseError(initialError.error)}`);
-      if (!profileResult.data || !categoryResult.data || !sourceResult.data || !budgetResult.data || !membershipResult.data) {
+      if (!profileResult.data || !categoryResult.data || !sourceResult.data || !budgetResult.data || !membershipResult.data || !notificationResult.data || !recurringResult.data) {
         throw new Error("Supabase returned incomplete account data. Check the API response and Row Level Security policies.");
       }
       setProfile(profileResult.data);
       setCategories(categoryResult.data);
       setSources(sourceResult.data);
+      setRecurringPayments(recurringResult.data);
+      const unreadNotifications = notificationResult.data;
+      const unreadIds = new Set(unreadNotifications.map((item) => item.id));
+      if (notificationsInitialized.current) {
+        unreadNotifications
+          .filter((item) => !knownNotificationIds.current.has(item.id))
+          .forEach((item) => notify(item.title));
+      }
+      notificationsInitialized.current = true;
+      knownNotificationIds.current = unreadIds;
+      setNotifications(unreadNotifications);
       const allTransactions: Transaction[] = [];
       for (let offset = 0; ; offset += 1000) {
         const transactionPage = await supabase.from("transactions").select("*").order("occurred_at", { ascending: false }).range(offset, offset + 999);
@@ -191,6 +255,19 @@ function App() {
       setLoading(false);
       setProfileLoaded(true);
     }
+  }, [session?.user.id, notify]);
+
+  const refreshTransactions = useCallback(async () => {
+    if (!supabase || !session?.user.id) throw new Error("Your session is unavailable. Sign in again and refresh.");
+    const refreshed: Transaction[] = [];
+    for (let offset = 0; ; offset += 1000) {
+      const result = await supabase.from("transactions").select("*").order("occurred_at", { ascending: false }).range(offset, offset + 999);
+      if (result.error) throw new Error(formatSupabaseError(result.error));
+      if (!result.data) throw new Error("Supabase returned no transaction data.");
+      refreshed.push(...result.data);
+      if (result.data.length < 1000) break;
+    }
+    setTransactions(refreshed);
   }, [session?.user.id]);
 
   useEffect(() => {
@@ -220,6 +297,21 @@ function App() {
     const { data, error } = await supabase.from("profiles").update(updates).eq("id", session.user.id).select().single();
     if (error) throw error;
     setProfile(data);
+  };
+
+  const markNotificationRead = async (id: string) => {
+    if (!supabase) return;
+    const { error } = await supabase.rpc("set_notification_read", { p_notification_id: id });
+    if (error) { notify(`Couldn't update notification: ${formatSupabaseError(error)}`); return; }
+    knownNotificationIds.current.delete(id);
+    setNotifications((items) => items.filter((item) => item.id !== id));
+  };
+  const markAllNotificationsRead = async () => {
+    if (!supabase || !notifications.length) return;
+    const { error } = await supabase.rpc("set_all_notifications_read", {});
+    if (error) { notify(`Couldn't update notifications: ${formatSupabaseError(error)}`); return; }
+    knownNotificationIds.current.clear();
+    setNotifications([]);
   };
 
   if (!isSupabaseConfigured || !supabase) return <Auth configured={false} />;
@@ -254,29 +346,34 @@ function App() {
             <div className="font-display text-base font-extrabold tracking-tight lg:hidden">spendly</div>
           </div>
           <div className="flex items-center gap-2 sm:gap-3">
-            <button onClick={() => setNotificationsOpen((value) => !value)} aria-label="Open notifications" aria-expanded={notificationsOpen} className="relative rounded-xl border border-line bg-white p-2.5 text-[#68756d] hover:text-forest"><Bell size={17} /></button>
-            <button onClick={() => setPage("Settings")} className="flex items-center gap-2 rounded-xl border border-line bg-white py-1.5 pl-1.5 pr-2.5 hover:border-[#cbd6ce]"><span className="grid h-8 w-8 place-items-center rounded-lg bg-mint text-xs font-bold text-forest">{profile.display_name.slice(0, 1).toUpperCase()}</span><span className="hidden max-w-24 truncate text-xs font-semibold sm:block">{profile.display_name}</span><ChevronDown size={14} className="hidden text-muted sm:block" /></button>
+            <button onClick={() => setNotificationsOpen((value) => !value)} aria-label={`Notifications, ${notifications.length} unread`} aria-expanded={notificationsOpen} className="relative rounded-xl border border-line bg-white p-2.5 text-[#68756d] hover:text-forest"><Bell size={17} />{notifications.length > 0 && <span className="absolute -right-1.5 -top-1.5 grid min-h-[18px] min-w-[18px] place-items-center rounded-full bg-[#c8664f] px-1 text-[9px] font-bold text-white">{notifications.length > 99 ? "99+" : notifications.length}</span>}</button>
+            <button onClick={() => setPage("Settings")} aria-label="Open profile settings" className="flex items-center gap-2 rounded-xl border border-line bg-white py-1.5 pl-1.5 pr-2.5 hover:border-[#cbd6ce]"><span className="grid h-8 w-8 place-items-center rounded-lg bg-mint text-xs font-bold text-forest">{profile.display_name.slice(0, 1).toUpperCase()}</span><span className="hidden max-w-24 truncate text-xs font-semibold sm:block">{profile.display_name}</span></button>
           </div>
         </header>
-        {notificationsOpen && <NotificationPanel transactions={transactions} budgets={budgets} categories={categories} expenses={expenses} splits={splits} settlements={settlements} userId={session.user.id} currency={profile.currency} timezone={profile.timezone} close={() => setNotificationsOpen(false)} setPage={setPage} />}
+        {notificationsOpen && <NotificationPanel notifications={notifications} close={() => setNotificationsOpen(false)} openNotification={(item) => { void markNotificationRead(item.id); setNotificationsOpen(false); setPage(item.target_page); }} markAllRead={() => void markAllNotificationsRead()} />}
         <main className="mx-auto max-w-[1500px] px-4 py-6 sm:px-7 sm:py-8 lg:px-9 lg:py-9">
           {loadError && <div role="alert" className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-800"><span>{loadError}</span><button onClick={() => void loadData()} className="font-semibold underline">Try again</button></div>}
           {loading && <div aria-label="Refreshing data" className="fixed right-5 top-[82px] z-40 h-5 w-5 animate-spin rounded-full border-2 border-forest border-t-transparent" />}
           {page === "Overview" && <Overview profile={profile} userId={session.user.id} transactions={transactions} categories={categories} sources={sources} budgets={budgets} expenses={expenses} splits={splits} settlements={settlements} groups={groups} openTransaction={() => setTransactionModal("new")} setPage={setPage} />}
-          {page === "Transactions" && <TransactionsPage transactions={transactions} categories={categories} sources={sources} currency={profile.currency} timezone={profile.timezone} userId={session.user.id} openTransaction={setTransactionModal} reload={loadData} notify={notify} />}
+          {page === "Transactions" && <TransactionsPage transactions={transactions} recurringPayments={recurringPayments} categories={categories} sources={sources} currency={profile.currency} timezone={profile.timezone} userId={session.user.id} openTransaction={setTransactionModal} reload={loadData} notify={notify} />}
           {page === "Budgets" && <BudgetsPage profile={profile} updateProfile={updateProfile} budgets={budgets} transactions={transactions} categories={categories} currency={profile.currency} reload={loadData} notify={notify} />}
           {page === "Analytics" && <AnalyticsPage transactions={transactions} categories={categories} sources={sources} budgets={budgets} monthlyBudget={profile.monthly_budget} timezone={profile.timezone} currency={profile.currency} />}
+          {page === "Planning" && <PlanningPage profile={profile} categories={categories} sources={sources} transactions={transactions} budgets={budgets} schedules={recurringPayments} refreshTransactions={refreshTransactions} notify={notify} recordPurchase={(scenario) => {
+            setTransactionDraft({ title: scenario.title, amount: scenario.amount, type: "expense", category_id: scenario.category_id, occurred_at: `${scenario.planned_on}T12:00` });
+            setTransactionModal("new");
+          }} />}
+          {page === "Cash flow" && <CashflowCalendarPage profile={profile} userId={session.user.id} transactions={transactions} schedules={recurringPayments} sources={sources} groups={groups} members={members} expenses={expenses} splits={splits} settlements={settlements} setPage={setPage} openTransaction={(transaction) => setTransactionModal(transaction)} reload={loadData} notify={notify} />}
           {page === "Shared expenses" && <SharedPage groups={groups} invitations={invitations} members={members} expenses={expenses} splits={splits} settlements={settlements} categories={categories} userId={session.user.id} currency={profile.currency} timezone={profile.timezone} reload={loadData} notify={notify} />}
           {page === "Card Vault" && <VaultPage sources={sources} transactions={transactions} currency={profile.currency} userId={session.user.id} reload={loadData} notify={notify} />}
           {page === "Settings" && <SettingsPage profile={profile} updateProfile={updateProfile} email={session.user.email ?? ""} notify={notify} signOut={() => { void signOut(); }} />}
         </main>
       </div>
       <button onClick={() => setTransactionModal("new")} aria-label="Add transaction" className="fixed bottom-20 right-5 z-20 grid h-14 w-14 place-items-center rounded-full bg-forest text-white shadow-lg transition hover:scale-105 hover:bg-[#17573f] sm:bottom-7 lg:hidden"><Plus size={23} /></button>
-      {transactionModal && <TransactionDialog transaction={transactionModal === "new" ? null : transactionModal} categories={categories} sources={sources} currency={profile.currency} close={() => setTransactionModal(null)} saved={async (warning) => { setTransactionModal(null); await loadData(); notify(warning ?? "Transaction saved."); }} />}
+      {transactionModal && <TransactionDialog transaction={transactionModal === "new" ? null : transactionModal} draft={transactionModal === "new" ? transactionDraft : null} categories={categories} sources={sources} currency={profile.currency} close={() => { setTransactionModal(null); setTransactionDraft(null); }} saved={async (warning) => { setTransactionModal(null); setTransactionDraft(null); await loadData(); notify(warning ?? "Transaction saved."); }} />}
       <nav className="fixed inset-x-0 bottom-0 z-30 flex justify-around border-t border-line bg-white/95 px-1 pb-[env(safe-area-inset-bottom)] pt-1 backdrop-blur lg:hidden" aria-label="Mobile navigation">
         {navigation.slice(0, 5).map((item) => <button key={item.name} onClick={() => setPage(item.name)} className={`flex min-w-0 flex-col items-center gap-1 px-2 py-2 text-[10px] ${page === item.name ? "font-semibold text-forest" : "text-muted"}`}><item.icon size={18} /><span className="max-w-[72px] truncate">{item.name === "Shared expenses" ? "Shared" : item.name}</span></button>)}
       </nav>
-      <AnimatePresence>{toast && <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }} role="status" className="fixed bottom-20 left-1/2 z-[60] -translate-x-1/2 rounded-xl bg-ink px-4 py-3 text-sm font-medium text-white shadow-lg sm:bottom-6">{toast}</motion.div>}</AnimatePresence>
+      <div className="fixed bottom-20 left-1/2 z-[60] flex w-[min(92vw,420px)] -translate-x-1/2 flex-col-reverse gap-2 sm:bottom-6">{toasts.map((toast) => <AnimatePresence key={toast.id}><motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }} role="status" className="rounded-xl bg-ink px-4 py-3 text-sm font-medium text-white shadow-lg">{toast.message}</motion.div></AnimatePresence>)}</div>
     </div>
   );
 }
@@ -284,6 +381,7 @@ function App() {
 export default App;
 
 function Sidebar({ page, setPage, profile, open, close, signOut }: { page: PageKey; setPage: (page: PageKey) => void; profile: Profile; open: boolean; close: () => void; signOut: () => void }) {
+  const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   return <>
     {open && <button aria-label="Close navigation" onClick={close} className="fixed inset-0 z-40 bg-ink/30 lg:hidden" />}
     <aside className={`fixed inset-y-0 left-0 z-50 flex w-[248px] flex-col border-r border-line bg-white px-4 py-6 transition-transform lg:translate-x-0 ${open ? "translate-x-0" : "-translate-x-full"}`}>
@@ -300,52 +398,24 @@ function Sidebar({ page, setPage, profile, open, close, signOut }: { page: PageK
         <p className="text-xs font-semibold">Your money stays yours</p>
         <p className="mt-1 text-[11px] leading-4 text-muted">Spendly never asks for bank passwords or card security codes.</p>
       </div>
-      <button onClick={signOut} className="mt-3 flex items-center gap-3 rounded-xl px-3 py-2.5 text-left text-[13px] font-medium text-[#68756d] hover:bg-[#f5f7f5]"><LogOut size={17} />Sign out</button>
-      <div className="mt-1 flex items-center gap-2 border-t border-line px-2 pt-4">
+      <div className="relative mt-1 flex items-center gap-2 border-t border-line px-2 pt-4">
         <span className="grid h-8 w-8 place-items-center rounded-full bg-[#e8eee8] text-xs font-bold text-forest">{profile.display_name.slice(0, 1).toUpperCase()}</span>
         <div className="min-w-0"><p className="truncate text-xs font-semibold">{profile.display_name}</p><p className="text-[10px] text-muted">Personal space</p></div>
-        <MoreHorizontal size={17} className="ml-auto text-muted" />
+        <button onClick={() => setProfileMenuOpen((value) => !value)} aria-label="Profile menu" aria-expanded={profileMenuOpen} className="ml-auto rounded-lg p-1.5 text-muted hover:bg-canvas hover:text-ink"><MoreHorizontal size={17} /></button>
+        {profileMenuOpen && <div className="absolute bottom-14 right-0 z-10 w-48 rounded-xl border border-line bg-white p-1.5 shadow-lg" role="menu">
+          <button role="menuitem" onClick={() => { setPage("Settings"); setProfileMenuOpen(false); close(); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2.5 text-left text-xs font-medium hover:bg-canvas"><Settings size={15} /> Profile & settings</button>
+          <button role="menuitem" onClick={() => { setProfileMenuOpen(false); signOut(); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2.5 text-left text-xs font-medium text-[#a95643] hover:bg-[#fff3ef]"><LogOut size={15} /> Sign out</button>
+        </div>}
       </div>
     </aside>
   </>;
 }
 
-function NotificationPanel({ transactions, budgets, categories, expenses, splits, settlements, userId, currency, timezone, close, setPage }: { transactions: Transaction[]; budgets: Budget[]; categories: Category[]; expenses: SharedExpense[]; splits: ExpenseSplit[]; settlements: Settlement[]; userId: string; currency: string; timezone: string; close: () => void; setPage: (page: PageKey) => void }) {
-  const monthStart = monthBounds(new Date(), timezone).start;
-  const monthTransactions = transactionsInMonth(transactions, monthStart, timezone);
-  const overall = budgets.find((item) => item.month_start === monthStart && !item.category_id);
-  const overallLimit = Number(overall?.amount ?? 0);
-  const overallSpent = sumByType(monthTransactions, "expense");
-  const notices: { title: string; body: string; page: PageKey; tone: string }[] = [];
-  if (overallLimit > 0 && overallSpent >= overallLimit) {
-    notices.push({ title: "Monthly budget reached", body: `You've spent ${formatCurrency(overallSpent, currency)} of your ${formatCurrency(overallLimit, currency)} target.`, page: "Budgets", tone: "text-[#bd684d]" });
-  } else if (overallLimit > 0 && overallSpent / overallLimit >= .8) {
-    notices.push({ title: "Budget getting close", body: `${Math.round(overallSpent / overallLimit * 100)}% of your monthly target is used.`, page: "Budgets", tone: "text-[#ae8240]" });
-  }
-  for (const budget of budgets.filter((item) => item.month_start === monthStart && item.category_id)) {
-    const progress = budgetProgress(monthTransactions, budget, budget.category_id, timezone);
-    if (progress.percent >= 80) notices.push({
-      title: `${categories.find((category) => category.id === budget.category_id)?.name ?? "Category"} ${progress.percent >= 100 ? "limit reached" : "limit approaching"}`,
-      body: `${formatCurrency(progress.spent, currency)} spent of ${formatCurrency(budget.amount, currency)}.`,
-      page: "Budgets",
-      tone: progress.percent >= 100 ? "text-[#bd684d]" : "text-[#ae8240]",
-    });
-  }
-  const sharedBalances = new Map<string, number>();
-  for (const expense of expenses) {
-    for (const split of splits.filter((entry) => entry.expense_id === expense.id)) sharedBalances.set(`${expense.group_id}:${split.user_id}`, (sharedBalances.get(`${expense.group_id}:${split.user_id}`) ?? 0) + amountInMinorUnits(split.amount_owed));
-    if (expense.paid_by) sharedBalances.set(`${expense.group_id}:${expense.paid_by}`, (sharedBalances.get(`${expense.group_id}:${expense.paid_by}`) ?? 0) - amountInMinorUnits(expense.amount));
-  }
-  for (const settlement of settlements) {
-    sharedBalances.set(`${settlement.group_id}:${settlement.payer_id}`, (sharedBalances.get(`${settlement.group_id}:${settlement.payer_id}`) ?? 0) - amountInMinorUnits(settlement.amount));
-    sharedBalances.set(`${settlement.group_id}:${settlement.payee_id}`, (sharedBalances.get(`${settlement.group_id}:${settlement.payee_id}`) ?? 0) + amountInMinorUnits(settlement.amount));
-  }
-  const owedGroups = [...sharedBalances].filter(([key, balance]) => key.endsWith(`:${userId}`) && balance > 0).length;
-  if (owedGroups) notices.push({ title: "Shared expenses need a look", body: `You have a balance to settle in ${owedGroups} group${owedGroups === 1 ? "" : "s"}.`, page: "Shared expenses", tone: "text-forest" });
+function NotificationPanel({ notifications, close, openNotification, markAllRead }: { notifications: UserNotification[]; close: () => void; openNotification: (item: UserNotification) => void; markAllRead: () => void }) {
   return <div className="fixed inset-0 z-40 bg-ink/15 lg:absolute lg:inset-auto lg:right-8 lg:top-[62px] lg:bg-transparent" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}>
     <section className="absolute inset-x-0 bottom-0 max-h-[75vh] overflow-y-auto rounded-t-2xl border border-line bg-white p-5 shadow-xl sm:left-auto sm:right-4 sm:top-2 sm:bottom-auto sm:w-[340px] sm:rounded-2xl lg:right-0" role="dialog" aria-label="Notifications">
-      <div className="mb-4 flex items-center justify-between"><div><h2 className="font-display text-sm font-bold">Your check-in</h2><p className="mt-1 text-[10px] text-muted">Helpful reminders from your activity</p></div><button onClick={close} aria-label="Close notifications" className="rounded-lg p-1.5 text-muted hover:bg-canvas"><X size={16} /></button></div>
-      {notices.length ? <div className="divide-y divide-line">{notices.map((notice, index) => <button key={`${notice.title}-${index}`} onClick={() => { setPage(notice.page); close(); }} className="block w-full py-3 text-left first:pt-0"><span className={`text-xs font-semibold ${notice.tone}`}>{notice.title}</span><span className="mt-1 block text-[11px] leading-4 text-muted">{notice.body}</span></button>)}</div> : <div className="py-5 text-center"><span className="mx-auto grid h-9 w-9 place-items-center rounded-full bg-mint text-forest"><Check size={17} /></span><p className="mt-2 text-xs font-semibold">All caught up</p><p className="mt-1 text-[10px] text-muted">No budget alerts or shared balances need attention.</p></div>}
+      <div className="mb-4 flex items-center justify-between"><div><h2 className="font-display text-sm font-bold">Notifications</h2><p className="mt-1 text-[10px] text-muted">{notifications.length ? `${notifications.length} unread alert${notifications.length === 1 ? "" : "s"}` : "You're all caught up"}</p></div><div className="flex items-center gap-1">{notifications.length > 0 && <button onClick={markAllRead} className="rounded-lg px-2 py-1.5 text-[10px] font-semibold text-forest hover:bg-mint">Mark all read</button>}<button onClick={close} aria-label="Close notifications" className="rounded-lg p-1.5 text-muted hover:bg-canvas"><X size={16} /></button></div></div>
+      {notifications.length ? <div className="divide-y divide-line">{notifications.map((notice) => <button key={notice.id} onClick={() => openNotification(notice)} className="block w-full py-3 text-left first:pt-0"><span className="flex items-center gap-2 text-xs font-semibold"><i className="h-2 w-2 shrink-0 rounded-full bg-[#d07958]" />{notice.title}</span><span className="mt-1 block pl-4 text-[11px] leading-4 text-muted">{notice.body}</span><span className="mt-1 block pl-4 text-[9px] text-[#99a39b]">{dateLabel(notice.created_at)}</span></button>)}</div> : <div className="py-5 text-center"><span className="mx-auto grid h-9 w-9 place-items-center rounded-full bg-mint text-forest"><Check size={17} /></span><p className="mt-2 text-xs font-semibold">All caught up</p><p className="mt-1 text-[10px] text-muted">Budget alerts will appear here when you approach a limit.</p></div>}
     </section>
   </div>;
 }
@@ -384,22 +454,6 @@ function Onboarding({ userName, save, signOut }: { userName: string; save: (valu
   </div></main>;
 }
 
-function Field({ label, children }: { label: string; children: ReactNode }) {
-  return <label className="block text-xs font-semibold text-[#56645b]">{label}<div className="mt-1.5 [&_input]:block [&_input]:w-full [&_input]:rounded-xl [&_input]:border-line [&_input]:bg-white [&_input]:px-3.5 [&_input]:py-3 [&_input]:text-sm [&_input]:font-normal [&_select]:block [&_select]:w-full [&_select]:rounded-xl [&_select]:border-line [&_select]:bg-white [&_select]:px-3.5 [&_select]:py-3 [&_select]:text-sm [&_select]:font-normal">{children}</div></label>;
-}
-
-function PageHeading({ eyebrow, title, description, action }: { eyebrow?: string; title: string; description?: string; action?: ReactNode }) {
-  return <div className="mb-7 flex flex-wrap items-end justify-between gap-4"><div>{eyebrow && <p className="mb-1.5 text-[10px] font-bold uppercase tracking-[.15em] text-forest">{eyebrow}</p>}<h1 className="font-display text-[26px] font-bold tracking-[-.035em] sm:text-[30px]">{title}</h1>{description && <p className="mt-1.5 text-sm text-muted">{description}</p>}</div>{action}</div>;
-}
-
-function Card({ children, className = "" }: { children: ReactNode; className?: string }) {
-  return <section className={`rounded-2xl border border-line bg-white p-5 shadow-card sm:p-6 ${className}`}>{children}</section>;
-}
-
-function Empty({ title, body, action }: { title: string; body: string; action?: ReactNode }) {
-  return <div className="flex min-h-[220px] flex-col items-center justify-center px-5 py-9 text-center"><div className="mb-3 grid h-11 w-11 place-items-center rounded-2xl bg-[#f2f5f2] text-[#769180]"><Sparkles size={19} /></div><h3 className="text-sm font-semibold">{title}</h3><p className="mt-1 max-w-xs text-xs leading-5 text-muted">{body}</p>{action && <div className="mt-4">{action}</div>}</div>;
-}
-
 function AppSkeleton() {
   return <main className="min-h-screen bg-canvas p-5 sm:p-8" role="status" aria-label="Loading your Spendly workspace">
     <div className="mx-auto max-w-6xl animate-pulse space-y-6"><div className="h-7 w-48 rounded-lg bg-[#e8ece8]" /><div className="h-10 w-72 rounded-lg bg-[#e8ece8]" /><div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">{Array.from({ length: 4 }, (_, index) => <div key={index} className="h-32 rounded-2xl border border-line bg-white p-5"><div className="h-3 w-24 rounded bg-[#edf0ed]" /><div className="mt-6 h-6 w-32 rounded bg-[#edf0ed]" /></div>)}</div><div className="grid gap-5 xl:grid-cols-[1.6fr_1fr]"><div className="h-80 rounded-2xl border border-line bg-white" /><div className="h-80 rounded-2xl border border-line bg-white" /></div></div>
@@ -433,138 +487,7 @@ function ErrorScreen({ error, retry }: { error: string; retry: () => void }) {
   return <main className="grid min-h-screen place-items-center bg-canvas px-5"><div className="max-w-md rounded-2xl border border-line bg-white p-7 text-center"><h1 className="font-display text-xl font-bold">Couldn't load your account</h1><p role="alert" className="mt-2 text-sm text-muted">{error}</p><button onClick={retry} className="mt-5 rounded-xl bg-forest px-4 py-2.5 text-sm font-semibold text-white">Try again</button></div></main>;
 }
 
-function Overview({ profile, userId, transactions, categories, sources, budgets, expenses, splits, settlements, groups, openTransaction, setPage }: { profile: Profile; userId: string; transactions: Transaction[]; categories: Category[]; sources: PaymentSource[]; budgets: Budget[]; expenses: SharedExpense[]; splits: ExpenseSplit[]; settlements: Settlement[]; groups: Group[]; openTransaction: () => void; setPage: (page: PageKey) => void }) {
-  const [range, setRange] = useState("7d");
-  const now = new Date();
-  const { start } = monthBounds(now, profile.timezone);
-  const previousMonth = addMonth(start, -1);
-  const thisMonthItems = transactionsInMonth(transactions, start, profile.timezone);
-  const previousMonthSpent = sumByType(transactionsInMonth(transactions, previousMonth, profile.timezone), "expense");
-  const spent = sumByType(thisMonthItems, "expense");
-  const income = sumByType(thisMonthItems, "income");
-  const budget = budgets.find((item) => item.month_start === start && !item.category_id);
-  const totalBudget = budget?.amount ?? profile.monthly_budget;
-  const remaining = totalBudget - spent;
-  const savings = previousMonthSpent ? (spent - previousMonthSpent) / previousMonthSpent * 100 : null;
-  const chartData = useMemo(() => makeTrend(transactions, range, profile.timezone), [transactions, range, profile.timezone]);
-  const breakdown = categorySpending(thisMonthItems, categories).slice(0, 5);
-  const sharedBalances = new Map<string, number>();
-  for (const expense of expenses) {
-    for (const split of splits.filter((entry) => entry.expense_id === expense.id)) sharedBalances.set(`${expense.group_id}:${split.user_id}`, (sharedBalances.get(`${expense.group_id}:${split.user_id}`) ?? 0) + amountInMinorUnits(split.amount_owed));
-    if (expense.paid_by) sharedBalances.set(`${expense.group_id}:${expense.paid_by}`, (sharedBalances.get(`${expense.group_id}:${expense.paid_by}`) ?? 0) - amountInMinorUnits(expense.amount));
-  }
-  for (const settlement of settlements) {
-    sharedBalances.set(`${settlement.group_id}:${settlement.payer_id}`, (sharedBalances.get(`${settlement.group_id}:${settlement.payer_id}`) ?? 0) - amountInMinorUnits(settlement.amount));
-    sharedBalances.set(`${settlement.group_id}:${settlement.payee_id}`, (sharedBalances.get(`${settlement.group_id}:${settlement.payee_id}`) ?? 0) + amountInMinorUnits(settlement.amount));
-  }
-  const upcoming = [...sharedBalances]
-    .filter(([key, value]) => key.endsWith(`:${userId}`) && value > 0)
-    .slice(0, 3)
-    .map(([key, balance]) => {
-      const groupId = key.slice(0, key.lastIndexOf(":"));
-      return { id: groupId, title: groups.find((group) => group.id === groupId)?.name ?? "Shared group", amount: balance / 100 };
-    });
-  const amount = (value: number) => formatCurrency(value, profile.currency);
-  return <>
-    <PageHeading eyebrow={new Intl.DateTimeFormat("en", { month: "long", year: "numeric" }).format(now)} title="Your money, at a glance" description="A little clarity for the choices ahead." action={<button onClick={openTransaction} className="hidden items-center gap-2 rounded-xl bg-forest px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-[#17573f] sm:flex"><Plus size={17} /> Add transaction</button>} />
-    {transactions.length === 0 && <div className="mb-5 flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-[#d8e9dc] bg-[#edf6ef] p-5"><div><p className="font-semibold">Your first step is the easiest.</p><p className="mt-1 text-sm text-[#667d6c]">Add a transaction to start seeing your money story take shape.</p></div><button onClick={openTransaction} className="rounded-xl bg-forest px-4 py-2.5 text-sm font-semibold text-white">Add your first transaction</button></div>}
-    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-      <Metric title="Spent this month" value={amount(spent)} icon={ArrowUpRight} iconTone="peach" foot={savings === null ? "Your month is just getting started" : `${Math.abs(savings).toFixed(0)}% ${savings <= 0 ? "less" : "more"} than last month`} positive={savings === null || savings <= 0} />
-      <Metric title="Budget remaining" value={amount(remaining)} icon={Wallet} iconTone="mint" foot={`${amount(totalBudget)} monthly target`} positive={remaining >= 0} />
-      <Metric title="Income this month" value={amount(income)} icon={ArrowDownLeft} iconTone="mint" foot="Recorded income" positive />
-      <Metric title="Previous month" value={amount(previousMonthSpent)} icon={CalendarDays} iconTone="lavender" foot="Total expenses" />
-    </div>
-    <div className="mt-5 grid gap-5 xl:grid-cols-[1.65fr_1fr]">
-      <Card>
-        <div className="mb-5 flex flex-wrap items-start justify-between gap-3"><div><h2 className="font-display text-base font-bold">Spending over time</h2><p className="mt-1 text-xs text-muted">Your daily expenses, in {profile.currency}</p></div><select aria-label="Spending chart date range" value={range} onChange={(event) => setRange(event.target.value)} className="rounded-lg border-line py-1.5 pl-3 pr-8 text-xs font-medium text-[#5b685f]"><option value="7d">Last 7 days</option><option value="30d">Last 30 days</option><option value="90d">Last 90 days</option></select></div>
-        <div className="h-[245px] w-full">
-          {transactions.length === 0 ? <Empty title="Your spending story starts here" body="Once you add transactions, this chart will show how your spending moves over time." /> :
-            <ResponsiveContainer width="100%" height="100%"><AreaChart data={chartData} margin={{ top: 10, right: 3, left: -20, bottom: 0 }}><defs><linearGradient id="spendFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#4a9a70" stopOpacity={0.18} /><stop offset="95%" stopColor="#4a9a70" stopOpacity={0} /></linearGradient></defs><CartesianGrid vertical={false} stroke="#edf0ed" /><XAxis dataKey="label" axisLine={false} tickLine={false} tick={{ fontSize: 10, fill: "#919b94" }} minTickGap={20} /><YAxis axisLine={false} tickLine={false} tick={{ fontSize: 10, fill: "#919b94" }} tickFormatter={(value: number) => value >= 1000 ? `${(value / 1000).toFixed(0)}k` : String(value)} /><Tooltip formatter={(value: number) => [amount(value), "Spent"]} contentStyle={{ borderRadius: 12, border: "1px solid #e8ebe7", fontSize: 12 }} /><Area type="monotone" dataKey="amount" stroke="#35825a" strokeWidth={2.2} fill="url(#spendFill)" activeDot={{ r: 4, strokeWidth: 0 }} /></AreaChart></ResponsiveContainer>}
-        </div>
-      </Card>
-      <Card>
-        <div className="mb-4 flex items-start justify-between"><div><h2 className="font-display text-base font-bold">Where it goes</h2><p className="mt-1 text-xs text-muted">This month's spending</p></div><button onClick={() => setPage("Analytics")} aria-label="View all analytics" className="rounded-lg p-1.5 text-muted hover:bg-canvas"><ChevronRight size={17} /></button></div>
-        {!breakdown.length ? <Empty title="No categories yet" body="Categorize a transaction to see where your money is going." /> : <>
-          <div className="h-[165px]"><ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={breakdown} dataKey="amount" nameKey="category.name" innerRadius={48} outerRadius={72} paddingAngle={3} stroke="none">{breakdown.map((item) => <Cell key={item.category.id} fill={item.category.color} />)}</Pie><Tooltip formatter={(value: number) => amount(value)} contentStyle={{ borderRadius: 12, border: "1px solid #e8ebe7", fontSize: 12 }} /></PieChart></ResponsiveContainer></div>
-          <div className="space-y-3">{breakdown.slice(0, 4).map(({ category, amount: total }) => <div key={category.id} className="flex items-center justify-between text-xs"><span className="flex items-center gap-2"><i className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: category.color }} />{category.name}</span><span className="font-semibold">{amount(total)}</span></div>)}</div>
-        </>}
-      </Card>
-    </div>
-    <div className="mt-5 grid gap-5 xl:grid-cols-[1.4fr_1fr]">
-      <Card className="!p-0">
-        <div className="flex items-center justify-between border-b border-line px-5 py-4 sm:px-6"><div><h2 className="font-display text-base font-bold">Recent transactions</h2><p className="mt-1 text-xs text-muted">Your latest money moves</p></div><button onClick={() => setPage("Transactions")} className="text-xs font-semibold text-forest hover:underline">See all</button></div>
-        <div className="divide-y divide-line">{transactions.slice(0, 5).map((transaction) => <TransactionRow key={transaction.id} transaction={transaction} category={categories.find((category) => category.id === transaction.category_id)} source={sourcesLabel(transaction.payment_source_id, sources)} currency={profile.currency} timezone={profile.timezone} />)}
-          {!transactions.length && <Empty title="No transactions yet" body="Add your first purchase or income to see it here." action={<button onClick={openTransaction} className="rounded-lg bg-forest px-3 py-2 text-xs font-semibold text-white">Add transaction</button>} />}
-        </div>
-      </Card>
-      <Card>
-        <div className="mb-4 flex items-center justify-between"><div><h2 className="font-display text-base font-bold">Budget check-in</h2><p className="mt-1 text-xs text-muted">A gentle look at your limits</p></div><button onClick={() => setPage("Budgets")} className="text-xs font-semibold text-forest hover:underline">Manage</button></div>
-        <div className="mb-5"><BudgetLine title="Overall monthly budget" spent={spent} limit={totalBudget} currency={profile.currency} /></div>
-        {budgets.filter((item) => item.month_start === start && item.category_id).slice(0, 3).map((item) => <div className="mb-4" key={item.id}><BudgetLine title={categories.find((category) => category.id === item.category_id)?.name ?? "Category"} spent={budgetProgress(transactions, item, item.category_id, profile.timezone).spent} limit={item.amount} currency={profile.currency} /></div>)}
-        {budgets.filter((item) => item.month_start === start && item.category_id).length === 0 && <p className="border-t border-line pt-4 text-xs leading-5 text-muted">Set category limits to keep an eye on the areas that matter most.</p>}
-      </Card>
-    </div>
-    {!!upcoming.length && <Card className="mt-5"><div className="mb-3 flex items-center justify-between"><div><h2 className="font-display text-base font-bold">Shared expenses to settle</h2><p className="mt-1 text-xs text-muted">A friendly reminder for your groups</p></div><button onClick={() => setPage("Shared expenses")} className="text-xs font-semibold text-forest hover:underline">Open groups</button></div>{upcoming.map((expense) => <div key={expense.id} className="flex items-center justify-between border-t border-line py-3 text-sm"><span>{expense.title}</span><span className="font-semibold">{amount(expense.amount)}</span></div>)}</Card>}
-  </>;
-}
-
-function sourcesLabel(id: string | null, sources: PaymentSource[]) {
-  return sources.find((source) => source.id === id)?.label;
-}
-
-function Metric({ title, value, icon: Icon, iconTone, foot, positive }: { title: string; value: string; icon: LucideIcon; iconTone: string; foot: string; positive?: boolean }) {
-  return <Card className="!p-4 sm:!p-5"><div className="flex items-start justify-between"><p className="text-xs font-medium text-muted">{title}</p><span className={`grid h-8 w-8 place-items-center rounded-xl ${iconTone === "mint" ? "bg-mint text-forest" : iconTone === "peach" ? "bg-peach text-[#b27044]" : "bg-[#f0eef9] text-[#8171aa]"}`}><Icon size={16} /></span></div><p className="mt-3 font-display text-[23px] font-bold tracking-tight">{value}</p><p className={`mt-1 text-[10px] ${positive === false ? "text-[#be7658]" : "text-muted"}`}>{foot}</p></Card>;
-}
-
-function TransactionRow({ transaction, category, source, currency, timezone }: { transaction: Transaction; category?: Category; source?: string; currency: string; timezone?: string }) {
-  return <div className="flex items-center gap-3 px-5 py-3.5 sm:px-6">
-    <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl text-sm" style={{ background: category?.color ? `${category.color}20` : "#f1f3f1", color: category?.color ?? "#718077" }}>{category?.icon ?? (transaction.type === "income" ? "↙" : "◦")}</span>
-    <div className="min-w-0 flex-1"><p className="truncate text-xs font-semibold">{transaction.title}</p><p className="mt-0.5 truncate text-[10px] text-muted">{category?.name ?? "Uncategorized"} · {methodLabels[transaction.payment_method]}{source ? ` · ${source}` : ""}</p></div>
-    <div className="text-right"><p className={`text-xs font-semibold ${transaction.type === "income" ? "text-forest" : "text-ink"}`}>{transaction.type === "income" ? "+" : "−"}{formatCurrency(transaction.amount, currency)}</p><p className="mt-0.5 text-[10px] text-muted">{dateLabel(transaction.occurred_at, timezone)}</p></div>
-  </div>;
-}
-
-function BudgetLine({ title, spent, limit, currency }: { title: string; spent: number; limit: number; currency: string }) {
-  const percent = limit > 0 ? Math.min(100, spent / limit * 100) : 0;
-  const exceeded = spent > limit;
-  return <div><div className="mb-1.5 flex items-center justify-between gap-2 text-xs"><span className="truncate font-medium">{title}</span><span className="shrink-0 text-muted">{formatCurrency(spent, currency)} <span className="text-[#b0b8b2]">/</span> {formatCurrency(limit, currency)}</span></div><div className="h-1.5 overflow-hidden rounded-full bg-[#edf0ed]"><div className={`h-full rounded-full transition-all ${exceeded ? "bg-[#d47c61]" : percent >= 80 ? "bg-[#d6a25f]" : "bg-[#5a9a70]"}`} style={{ width: `${percent}%` }} /></div><p className={`mt-1 text-[10px] ${exceeded ? "text-[#bc6950]" : "text-muted"}`}>{exceeded ? `${formatCurrency(spent - limit, currency)} over target` : `${Math.round(percent)}% used`}</p></div>;
-}
-
-function makeTrend(transactions: Transaction[], range: string, timezone = Intl.DateTimeFormat().resolvedOptions().timeZone) {
-  const days = range === "7d" ? 7 : range === "30d" ? 30 : 90;
-  const todayKey = dateInTimezone(new Date().toISOString(), timezone);
-  const [year, month, day] = todayKey.split("-").map(Number);
-  const today = new Date(Date.UTC(year, month - 1, day));
-  const values = new Map<string, number>();
-  for (const transaction of transactions) {
-    if (transaction.type !== "expense") continue;
-    const key = dateInTimezone(transaction.occurred_at, timezone);
-    values.set(key, (values.get(key) ?? 0) + amountInMinorUnits(transaction.amount));
-  }
-  return Array.from({ length: days }, (_, index) => {
-    const date = new Date(today);
-    date.setUTCDate(today.getUTCDate() - (days - 1 - index));
-    const key = date.toISOString().slice(0, 10);
-    return { label: new Intl.DateTimeFormat("en", { month: "short", day: days > 30 ? undefined : "numeric", timeZone: "UTC" }).format(date), amount: (values.get(key) ?? 0) / 100 };
-  });
-}
-
-function makeAnalyticsTrend(transactions: Transaction[], days: number, timezone: string) {
-  if (days <= 90) return makeTrend(transactions, days <= 30 ? "30d" : "90d", timezone);
-  const currentMonth = monthBounds(new Date(), timezone).start;
-  const totals = new Map<string, number>();
-  for (const transaction of transactions) {
-    const key = dateInTimezone(transaction.occurred_at, timezone).slice(0, 7);
-    totals.set(key, (totals.get(key) ?? 0) + amountInMinorUnits(transaction.amount));
-  }
-  return Array.from({ length: 12 }, (_, index) => {
-    const key = addMonth(currentMonth, index - 11).slice(0, 7);
-    const date = new Date(`${key}-01T12:00:00Z`);
-    return { label: new Intl.DateTimeFormat("en", { month: "short", timeZone: "UTC" }).format(date), amount: (totals.get(key) ?? 0) / 100 };
-  });
-}
-
-function TransactionsPage({ transactions, categories, sources, currency, timezone, userId, openTransaction, reload, notify }: { transactions: Transaction[]; categories: Category[]; sources: PaymentSource[]; currency: string; timezone: string; userId: string; openTransaction: (transaction: Transaction | "new") => void; reload: () => Promise<void>; notify: (message: string) => void }) {
+function TransactionsPage({ transactions, recurringPayments, categories, sources, currency, timezone, userId, openTransaction, reload, notify }: { transactions: Transaction[]; recurringPayments: RecurringPayment[]; categories: Category[]; sources: PaymentSource[]; currency: string; timezone: string; userId: string; openTransaction: (transaction: Transaction | "new") => void; reload: () => Promise<void>; notify: (message: string) => void }) {
   const [search, setSearch] = useState("");
   const [categoryFilter, setCategoryFilter] = useState("");
   const [methodFilter, setMethodFilter] = useState("");
@@ -576,6 +499,8 @@ function TransactionsPage({ transactions, categories, sources, currency, timezon
   const [maxAmount, setMaxAmount] = useState("");
   const [page, setCurrentPage] = useState(0);
   const [categoryModal, setCategoryModal] = useState(false);
+  const [recurringModal, setRecurringModal] = useState(false);
+  const [receiptTransaction, setReceiptTransaction] = useState<Transaction | null>(null);
   const pageSize = 12;
 
   const filtered = transactions.filter((item) => {
@@ -606,7 +531,7 @@ function TransactionsPage({ transactions, categories, sources, currency, timezon
 
   const clearFilters = () => { setSearch(""); setCategoryFilter(""); setMethodFilter(""); setTypeFilter(""); setFrom(""); setTo(""); setMinAmount(""); setMaxAmount(""); };
   return <>
-    <PageHeading eyebrow="YOUR ACTIVITY" title="Transactions" description={`${filtered.length} ${filtered.length === 1 ? "transaction" : "transactions"} in your history.`} action={<div className="flex gap-2"><button onClick={() => setCategoryModal(true)} className="hidden items-center gap-2 rounded-xl border border-line bg-white px-3 py-2.5 text-xs font-semibold text-[#59675e] sm:flex"><Tag size={15} /> Categories</button><button onClick={() => openTransaction("new")} className="flex items-center gap-2 rounded-xl bg-forest px-3.5 py-2.5 text-xs font-semibold text-white"><Plus size={16} /> Add transaction</button></div>} />
+    <PageHeading eyebrow="YOUR ACTIVITY" title="Transactions" description={`${filtered.length} ${filtered.length === 1 ? "transaction" : "transactions"} in your history.`} action={<div className="flex flex-wrap gap-2"><button onClick={() => setRecurringModal(true)} className="flex items-center gap-1.5 rounded-xl border border-line bg-white px-3 py-2.5 text-xs font-semibold text-[#59675e]"><Repeat2 size={15} /> <span className="hidden sm:inline">Recurring</span>{recurringPayments.filter((item) => item.enabled).length > 0 && <span className="grid h-4 min-w-4 place-items-center rounded-full bg-mint px-1 text-[9px] text-forest">{recurringPayments.filter((item) => item.enabled).length}</span>}</button><button onClick={() => setCategoryModal(true)} className="hidden items-center gap-2 rounded-xl border border-line bg-white px-3 py-2.5 text-xs font-semibold text-[#59675e] sm:flex"><Tag size={15} /> Categories</button><button onClick={() => downloadCsv(`spendly-transactions-${from || "all"}-to-${to || "all"}.csv`, transactionReportRows(filtered, categories, sources, currency, timezone))} disabled={!filtered.length} className="flex items-center gap-1.5 rounded-xl border border-line bg-white px-3 py-2.5 text-xs font-semibold text-[#59675e] disabled:opacity-40"><FileDown size={15} /><span className="hidden sm:inline">Export</span></button><button onClick={() => openTransaction("new")} className="flex items-center gap-2 rounded-xl bg-forest px-3.5 py-2.5 text-xs font-semibold text-white"><Plus size={16} /><span className="hidden sm:inline">Add</span></button></div>} />
     <Card className="!p-0">
       <div className="flex flex-col gap-3 border-b border-line p-4 sm:p-5">
         <div className="flex flex-wrap gap-2">
@@ -622,29 +547,35 @@ function TransactionsPage({ transactions, categories, sources, currency, timezon
         {shown.map((transaction) => {
           const category = categories.find((item) => item.id === transaction.category_id);
           const source = sources.find((item) => item.id === transaction.payment_source_id);
-          return <div key={transaction.id} className="group flex items-center gap-2">
-            <div className="min-w-0 flex-1"><TransactionRow transaction={transaction} category={category} source={source?.label} currency={currency} timezone={timezone} /></div>
-            <div className="mr-3 flex shrink-0 gap-1 opacity-100 sm:mr-5 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100">
-              <button onClick={() => openTransaction(transaction)} aria-label={`Edit ${transaction.title}`} className="rounded-lg p-2 text-muted hover:bg-canvas hover:text-forest"><SlidersHorizontal size={15} /></button>
-              <button onClick={() => void remove(transaction)} aria-label={`Delete ${transaction.title}`} className="rounded-lg p-2 text-muted hover:bg-red-50 hover:text-red-600"><Trash2 size={15} /></button>
-            </div>
+          return <div key={transaction.id} className="group grid grid-cols-[minmax(0,1fr)_2.5rem] items-center gap-1 pr-3 transition-colors hover:bg-[#fafbf9] sm:pr-4">
+            <TransactionRow transaction={transaction} category={category} source={source?.label} currency={currency} timezone={timezone} />
+            <TransactionActionsMenu
+              transactionTitle={transaction.title}
+              hasReceipt={Boolean(transaction.receipt_path)}
+              isShared={Boolean(transaction.shared_expense_id)}
+              onEdit={() => openTransaction(transaction)}
+              onViewReceipt={() => setReceiptTransaction(transaction)}
+              onDelete={() => void remove(transaction)}
+            />
           </div>;
         })}
       </div> : <Empty title={transactions.length ? "No matching transactions" : "A fresh start"} body={transactions.length ? "Try a different search or clear some filters." : "Your purchases and income will appear here once you add them."} action={transactions.length ? <button onClick={clearFilters} className="text-xs font-semibold text-forest">Clear filters</button> : <button onClick={() => openTransaction("new")} className="rounded-lg bg-forest px-3 py-2 text-xs font-semibold text-white">Add transaction</button>} />}
       {filtered.length > 0 && <div className="flex items-center justify-between border-t border-line px-5 py-3 text-xs text-muted"><span>Showing {page * pageSize + 1}–{Math.min((page + 1) * pageSize, filtered.length)} of {filtered.length}</span><div className="flex gap-1"><button disabled={page === 0} onClick={() => setCurrentPage((value) => value - 1)} aria-label="Previous page" className="rounded-lg p-1.5 hover:bg-canvas disabled:opacity-30"><ChevronLeft size={17} /></button><button disabled={page >= pages - 1} onClick={() => setCurrentPage((value) => value + 1)} aria-label="Next page" className="rounded-lg p-1.5 hover:bg-canvas disabled:opacity-30"><ChevronRight size={17} /></button></div></div>}
     </Card>
     {categoryModal && <CategoryDialog categories={categories} ownerId={userId} reload={reload} notify={notify} close={() => setCategoryModal(false)} />}
+    {recurringModal && <RecurringManager payments={recurringPayments} categories={categories} sources={sources} currency={currency} reload={reload} notify={notify} close={() => setRecurringModal(false)} />}
+    {receiptTransaction?.receipt_path && <ReceiptViewerDialog title={receiptTransaction.title} receiptPath={receiptTransaction.receipt_path} close={() => setReceiptTransaction(null)} />}
   </>;
 }
 
-function TransactionDialog({ transaction, categories, sources, currency, close, saved }: { transaction: Transaction | null; categories: Category[]; sources: PaymentSource[]; currency: string; close: () => void; saved: (warning?: string) => Promise<void> }) {
-  const [title, setTitle] = useState(transaction?.title ?? "");
-  const [amount, setAmount] = useState(transaction ? String(transaction.amount) : "");
-  const [type, setType] = useState<TransactionType>(transaction?.type ?? "expense");
-  const [categoryId, setCategoryId] = useState(transaction?.category_id ?? "");
-  const [method, setMethod] = useState<PaymentMethod>(transaction?.payment_method ?? "upi");
+function TransactionDialog({ transaction, draft, categories, sources, currency, close, saved }: { transaction: Transaction | null; draft: { title: string; amount: number; type: TransactionType; category_id: string | null; occurred_at: string } | null; categories: Category[]; sources: PaymentSource[]; currency: string; close: () => void; saved: (warning?: string) => Promise<void> }) {
+  const [title, setTitle] = useState(transaction?.title ?? draft?.title ?? "");
+  const [amount, setAmount] = useState(transaction ? String(transaction.amount) : draft ? String(draft.amount) : "");
+  const [type, setType] = useState<TransactionType>(transaction?.type ?? draft?.type ?? "expense");
+  const [categoryId, setCategoryId] = useState(transaction?.category_id ?? draft?.category_id ?? "");
+  const [method, setMethod] = useState<PaymentMethod>(transaction?.payment_method && transaction.payment_method !== "shared" ? transaction.payment_method : "upi");
   const [sourceId, setSourceId] = useState(transaction?.payment_source_id ?? "");
-  const [occurredAt, setOccurredAt] = useState(localDateTimeValue(transaction?.occurred_at));
+  const [occurredAt, setOccurredAt] = useState(localDateTimeValue(transaction?.occurred_at ?? draft?.occurred_at));
   const [notes, setNotes] = useState(transaction?.notes ?? "");
   const [receipt, setReceipt] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
@@ -679,6 +610,9 @@ function TransactionDialog({ transaction, categories, sources, currency, close, 
         title: title.trim(), amount: numericAmount, type, category_id: categoryId || null,
         payment_method: method, payment_source_id: sourceId || null,
         occurred_at: new Date(occurredAt).toISOString(), notes: notes.trim() || null, receipt_path: receiptPath,
+        shared_expense_id: transaction?.shared_expense_id ?? null,
+        recurring_payment_id: transaction?.recurring_payment_id ?? null,
+        recurring_occurrence_date: transaction?.recurring_occurrence_date ?? null,
       };
       const result = transaction
         ? await supabase.from("transactions").update(payload).eq("id", transaction.id)
@@ -709,7 +643,7 @@ function TransactionDialog({ transaction, categories, sources, currency, close, 
       <div className="grid grid-cols-2 gap-2 rounded-xl bg-[#f2f4f2] p-1"><button type="button" onClick={() => setType("expense")} className={`rounded-lg py-2 text-xs font-semibold ${type === "expense" ? "bg-white text-ink shadow-sm" : "text-muted"}`}>Expense</button><button type="button" onClick={() => setType("income")} className={`rounded-lg py-2 text-xs font-semibold ${type === "income" ? "bg-white text-ink shadow-sm" : "text-muted"}`}>Income</button></div>
       <Field label="Description or merchant"><input required value={title} onChange={(event) => setTitle(event.target.value)} placeholder="e.g. Coffee with Maya" autoFocus /></Field>
       <div className="grid grid-cols-[1fr_1.2fr] gap-3"><Field label={`Amount (${currency})`}><input required type="number" min="0.01" step="0.01" inputMode="decimal" value={amount} onChange={(event) => setAmount(event.target.value)} placeholder="0.00" /></Field><Field label="Date and time"><input required type="datetime-local" value={occurredAt} onChange={(event) => setOccurredAt(event.target.value)} /></Field></div>
-      <div className="grid grid-cols-2 gap-3"><Field label="Category"><select value={categoryId} onChange={(event) => setCategoryId(event.target.value)}><option value="">Uncategorized</option>{categories.map((category) => <option key={category.id} value={category.id}>{category.icon} {category.name}</option>)}</select></Field><Field label="Payment method"><select value={method} onChange={(event) => { setMethod(event.target.value as PaymentMethod); setSourceId(""); }}>{Object.entries(methodLabels).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></Field></div>
+      <div className="grid grid-cols-2 gap-3"><Field label="Category"><select value={categoryId} onChange={(event) => setCategoryId(event.target.value)}><option value="">Uncategorized</option>{categories.map((category) => <option key={category.id} value={category.id}>{category.icon} {category.name}</option>)}</select></Field><Field label="Payment method"><select value={method} onChange={(event) => { setMethod(event.target.value as PaymentMethod); setSourceId(""); }}>{paymentOptions.map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></Field></div>
       {availableSources.length > 0 && <Field label="Card or UPI account (optional)"><select value={sourceId} onChange={(event) => setSourceId(event.target.value)}><option value="">Not specified</option>{availableSources.map((source) => <option key={source.id} value={source.id}>{source.label}{source.last_four ? ` ···· ${source.last_four}` : ""}</option>)}</select></Field>}
       <Field label="Notes (optional)"><textarea value={notes} onChange={(event) => setNotes(event.target.value)} rows={2} placeholder="Anything worth remembering?" className="block w-full rounded-xl border-line text-sm" /></Field>
       <Field label="Receipt (optional)"><input type="file" accept="image/jpeg,image/png,image/webp,application/pdf" onChange={(event) => setReceipt(event.target.files?.[0] ?? null)} className="block w-full rounded-xl border border-line bg-white px-3 py-2 text-xs" /><span className="mt-1 block text-[10px] text-muted">Private upload · image or PDF · up to 5 MB</span>{transaction?.receipt_path && <button type="button" onClick={() => void receiptLink()} className="mt-1 text-xs font-semibold text-forest underline">View current receipt</button>}</Field>
@@ -719,13 +653,83 @@ function TransactionDialog({ transaction, categories, sources, currency, close, 
   </Modal>;
 }
 
-function Modal({ title, description, close, children }: { title: string; description?: string; close: () => void; children: ReactNode }) {
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") close(); };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [close]);
-  return <div className="fixed inset-0 z-[70] flex items-end justify-center bg-[#18251e]/40 p-0 backdrop-blur-[2px] sm:items-center sm:p-5" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}><motion.section initial={{ y: 12, opacity: .8 }} animate={{ y: 0, opacity: 1 }} className="max-h-[92vh] w-full max-w-[500px] overflow-y-auto rounded-t-3xl bg-white p-5 shadow-2xl sm:rounded-3xl sm:p-7" role="dialog" aria-modal="true" aria-labelledby="modal-heading"><div className="mb-5 flex items-start justify-between"><div><h2 id="modal-heading" className="font-display text-xl font-bold tracking-tight">{title}</h2>{description && <p className="mt-1 text-xs text-muted">{description}</p>}</div><button onClick={close} aria-label="Close dialog" className="rounded-lg p-1.5 text-muted hover:bg-canvas"><X size={18} /></button></div>{children}</motion.section></div>;
+function RecurringManager({ payments, categories, sources, currency, reload, notify, close }: { payments: RecurringPayment[]; categories: Category[]; sources: PaymentSource[]; currency: string; reload: () => Promise<void>; notify: (message: string) => void; close: () => void }) {
+  const [creating, setCreating] = useState(false);
+  const [title, setTitle] = useState("");
+  const [amount, setAmount] = useState("");
+  const [type, setType] = useState<TransactionType>("expense");
+  const [method, setMethod] = useState<PaymentMethod>("debit_card");
+  const [categoryId, setCategoryId] = useState("");
+  const [sourceId, setSourceId] = useState("");
+  const [frequency, setFrequency] = useState<RecurringPayment["frequency"]>("monthly");
+  const [dueOn, setDueOn] = useState(new Date().toISOString().slice(0, 10));
+  const [autopay, setAutopay] = useState(false);
+  const [notes, setNotes] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function createSchedule(event: FormEvent) {
+    event.preventDefault();
+    const numericAmount = Number(amount);
+    if (!title.trim() || !Number.isFinite(numericAmount) || numericAmount <= 0 || !dueOn || !supabase) {
+      setError("Enter a description, positive amount, and next due date.");
+      return;
+    }
+    if (sourceId && !sources.some((source) => source.id === sourceId && source.kind === method)) {
+      setError("Choose a payment source that matches the selected payment method.");
+      return;
+    }
+    setBusy(true); setError("");
+    const { error: saveError } = await supabase.rpc("create_recurring_payment", {
+      p_title: title.trim(),
+      p_amount: numericAmount,
+      p_type: type,
+      p_payment_method: method,
+      p_category_id: categoryId || null,
+      p_payment_source_id: sourceId || null,
+      p_frequency: frequency,
+      p_next_due_on: dueOn,
+      p_autopay: autopay,
+      p_notes: notes.trim() || null,
+    });
+    if (saveError) { setBusy(false); setError(formatSupabaseError(saveError)); return; }
+    setBusy(false); await reload(); setCreating(false); notify("Recurring schedule saved. Due items appear as expected until you record them as paid.");
+  }
+
+  async function toggle(payment: RecurringPayment) {
+    if (!supabase) return;
+    setBusy(true);
+    const { error: updateError } = await supabase.from("recurring_payments").update({ enabled: !payment.enabled }).eq("id", payment.id);
+    setBusy(false);
+    if (updateError) { setError(formatSupabaseError(updateError)); return; }
+    await reload(); notify(payment.enabled ? "Recurring schedule paused." : "Recurring schedule resumed.");
+  }
+
+  async function remove(payment: RecurringPayment) {
+    if (!window.confirm(`Delete the recurring schedule for "${payment.title}"? Transactions already recorded will be kept.`)) return;
+    if (!supabase) return;
+    const { error: deleteError } = await supabase.from("recurring_payments").delete().eq("id", payment.id);
+    if (deleteError) { setError(formatSupabaseError(deleteError)); return; }
+    await reload(); notify("Recurring schedule deleted.");
+  }
+
+  const matchingSources = sources.filter((source) => !source.archived && source.kind === method);
+  return <Modal title="Recurring & autopay" description="Schedules are expectations. Confirm each item as paid to create an actual transaction. Spendly never makes payments." close={close}>
+    {!creating ? <>
+      <div className="mb-4 flex items-center justify-between"><p className="text-xs text-muted">Scheduled entries are added when you open Spendly on or after their due date.</p><button onClick={() => setCreating(true)} className="flex shrink-0 items-center gap-1 rounded-lg bg-forest px-3 py-2 text-xs font-semibold text-white"><Plus size={14} /> Add</button></div>
+      {payments.length ? <div className="max-h-[55vh] divide-y divide-line overflow-y-auto">{payments.map((payment) => <div key={payment.id} className="flex items-center gap-3 py-3"><span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[#f2f5f2] text-forest"><Repeat2 size={16} /></span><div className="min-w-0 flex-1"><p className="truncate text-xs font-semibold">{payment.title}</p><p className="mt-1 text-[10px] text-muted">{payment.frequency} · next {dateLabel(`${payment.next_due_on}T12:00:00`, Intl.DateTimeFormat().resolvedOptions().timeZone)}{payment.autopay ? " · autopay label only" : ""}</p><p className="text-[10px] text-muted">{formatCurrency(payment.amount, currency)} · {payment.type}</p></div><button disabled={busy} onClick={() => void toggle(payment)} className={`rounded-lg px-2.5 py-1.5 text-[10px] font-semibold ${payment.enabled ? "bg-mint text-forest" : "bg-[#f1f3f1] text-muted"}`}>{payment.enabled ? "Active" : "Paused"}</button><button onClick={() => void remove(payment)} aria-label={`Delete ${payment.title} schedule`} className="rounded-lg p-2 text-muted hover:bg-red-50 hover:text-red-600"><Trash2 size={14} /></button></div>)}</div> : <Empty title="No recurring entries yet" body="Schedule rent, subscriptions, bills, or regular income. Due items remain estimates until you confirm them in the Cash flow calendar." action={<button onClick={() => setCreating(true)} className="rounded-lg bg-forest px-3 py-2 text-xs font-semibold text-white">Create a schedule</button>} />}
+    </> : <form onSubmit={(event) => void createSchedule(event)} className="max-h-[68vh] space-y-3 overflow-y-auto pr-1">
+      <div className="grid grid-cols-2 gap-2 rounded-xl bg-[#f2f4f2] p-1"><button type="button" onClick={() => setType("expense")} className={`rounded-lg py-2 text-xs font-semibold ${type === "expense" ? "bg-white shadow-sm" : "text-muted"}`}>Expense</button><button type="button" onClick={() => setType("income")} className={`rounded-lg py-2 text-xs font-semibold ${type === "income" ? "bg-white shadow-sm" : "text-muted"}`}>Income</button></div>
+      <Field label="Description"><input required value={title} onChange={(event) => setTitle(event.target.value)} placeholder="e.g. Internet bill" /></Field>
+      <div className="grid grid-cols-2 gap-3"><Field label={`Amount (${currency})`}><input required type="number" step="0.01" min="0.01" value={amount} onChange={(event) => setAmount(event.target.value)} /></Field><Field label="Frequency"><select value={frequency} onChange={(event) => setFrequency(event.target.value as RecurringPayment["frequency"])}><option value="weekly">Weekly</option><option value="monthly">Monthly</option><option value="yearly">Yearly</option></select></Field></div>
+      <div className="grid grid-cols-2 gap-3"><Field label="Next due date"><input type="date" required value={dueOn} onChange={(event) => setDueOn(event.target.value)} /></Field><Field label="Payment method"><select value={method} onChange={(event) => { setMethod(event.target.value as PaymentMethod); setSourceId(""); }}>{paymentOptions.map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></Field></div>
+      <div className="grid grid-cols-2 gap-3"><Field label="Category"><select value={categoryId} onChange={(event) => setCategoryId(event.target.value)}><option value="">Uncategorized</option>{categories.map((category) => <option key={category.id} value={category.id}>{category.icon} {category.name}</option>)}</select></Field>{matchingSources.length > 0 && <Field label="Payment source"><select value={sourceId} onChange={(event) => setSourceId(event.target.value)}><option value="">Not specified</option>{matchingSources.map((source) => <option key={source.id} value={source.id}>{source.label}</option>)}</select></Field>}</div>
+      <Field label="Notes (optional)"><input value={notes} onChange={(event) => setNotes(event.target.value)} placeholder="Reminder or reference" /></Field>
+      <label className="flex items-start gap-2 rounded-xl bg-[#f5f7f5] p-3 text-xs"><input type="checkbox" checked={autopay} onChange={(event) => setAutopay(event.target.checked)} className="mt-0.5 rounded border-line text-forest focus:ring-forest" /><span><strong>Autopay</strong><span className="mt-0.5 block text-[10px] leading-4 text-muted">Label this as an autopay for tracking. Spendly does not initiate or verify payments.</span></span></label>
+      {error && <p role="alert" className="rounded-lg bg-red-50 p-3 text-xs text-red-700">{error}</p>}
+      <div className="flex gap-2 pt-1"><button type="button" onClick={() => { setCreating(false); setError(""); }} className="flex-1 rounded-xl border border-line py-3 text-sm font-semibold">Back</button><button disabled={busy} className="flex-1 rounded-xl bg-forest py-3 text-sm font-semibold text-white disabled:opacity-60">{busy ? "Saving…" : "Save schedule"}</button></div>
+    </form>}
+  </Modal>;
 }
 
 function CategoryDialog({ categories, ownerId, reload, notify, close }: { categories: Category[]; ownerId: string; reload: () => Promise<void>; notify: (message: string) => void; close: () => void }) {
@@ -776,102 +780,17 @@ function addMonth(month: string, delta: number) {
   return monthInput(date);
 }
 
-function BudgetsPage({ profile, updateProfile, budgets, transactions, categories, currency, reload, notify }: { profile: Profile; updateProfile: (updates: Partial<Profile>) => Promise<void>; budgets: Budget[]; transactions: Transaction[]; categories: Category[]; currency: string; reload: () => Promise<void>; notify: (message: string) => void }) {
-  const [month, setMonth] = useState(monthBounds(new Date(), profile.timezone).start);
-  const [overallValue, setOverallValue] = useState("");
-  const [categoryValue, setCategoryValue] = useState("");
-  const [categoryId, setCategoryId] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const current = budgets.find((item) => item.month_start === month && !item.category_id);
-  const overallLimit = Number(current?.amount ?? profile.monthly_budget);
-  const monthTransactions = transactionsInMonth(transactions, month, profile.timezone);
-  const overall = budgetProgress(transactions, { month_start: month, category_id: null, amount: overallLimit } as Budget, null, profile.timezone);
-  const categoriesWithBudgets = budgets.filter((item) => item.month_start === month && item.category_id);
-  const monthDate = new Date(`${month}T00:00:00`);
-  const monthTitle = new Intl.DateTimeFormat("en", { month: "long", year: "numeric" }).format(monthDate);
-  const spent = sumByType(monthTransactions, "expense");
-  const income = sumByType(monthTransactions, "income");
-  const previousMonthSpent = sumByType(transactionsInMonth(transactions, addMonth(month, -1), profile.timezone), "expense");
-  const monthChange = previousMonthSpent > 0 ? (spent - previousMonthSpent) / previousMonthSpent * 100 : null;
-
-  async function saveOverall(event: FormEvent) {
-    event.preventDefault();
-    const value = Number(overallValue);
-    if (!Number.isFinite(value) || value <= 0 || !supabase) { setError("Enter a monthly target above zero."); return; }
-    setBusy(true); setError("");
-    try {
-      if (current) {
-        const { error: saveError } = await supabase.from("budgets").update({ amount: value }).eq("id", current.id);
-        if (saveError) throw saveError;
-      } else {
-        const { error: saveError } = await supabase.from("budgets").insert({ owner_id: profile.id, month_start: month, category_id: null, amount: value });
-        if (saveError) throw saveError;
-      }
-      if (month.slice(0, 7) === monthInput(new Date()).slice(0, 7)) await updateProfile({ monthly_budget: value });
-      setOverallValue(""); await reload(); notify("Monthly budget updated.");
-    } catch (caught) { setError(caught instanceof Error ? caught.message : "The budget couldn't be saved."); }
-    finally { setBusy(false); }
-  }
-
-  async function saveCategory(event: FormEvent) {
-    event.preventDefault();
-    const value = Number(categoryValue);
-    if (!categoryId || !Number.isFinite(value) || value <= 0 || !supabase) { setError("Choose a category and set a limit above zero."); return; }
-    setBusy(true); setError("");
-    const existing = categoriesWithBudgets.find((item) => item.category_id === categoryId);
-    const result = existing
-      ? await supabase.from("budgets").update({ amount: value }).eq("id", existing.id)
-      : await supabase.from("budgets").insert({ owner_id: profile.id, month_start: month, category_id: categoryId, amount: value });
-    setBusy(false);
-    if (result.error) { setError(result.error.message); return; }
-    setCategoryValue(""); setCategoryId(""); await reload(); notify("Category limit saved.");
-  }
-
-  async function removeCategoryBudget(budget: Budget) {
-    if (!window.confirm("Remove this category limit? Your transactions will not be affected.")) return;
-    if (!supabase) return;
-    const { error: deleteError } = await supabase.from("budgets").delete().eq("id", budget.id);
-    if (deleteError) { setError(deleteError.message); return; }
-    await reload(); notify("Category limit removed.");
-  }
-  const remaining = overallLimit - spent;
-  return <>
-    <PageHeading eyebrow="PLAN WITH INTENTION" title="Budgets" description="Set a gentle guardrail. Your actual spending always comes from your transactions." action={<div className="flex items-center gap-1 rounded-xl border border-line bg-white p-1"><button onClick={() => setMonth((value) => addMonth(value, -1))} aria-label="Previous month" className="rounded-lg p-2 text-muted hover:bg-canvas"><ChevronLeft size={17} /></button><span className="min-w-[118px] text-center text-xs font-semibold">{monthTitle}</span><button disabled={month >= monthInput(new Date())} onClick={() => setMonth((value) => addMonth(value, 1))} aria-label="Next month" className="rounded-lg p-2 text-muted hover:bg-canvas disabled:opacity-30"><ChevronRight size={17} /></button></div>} />
-    <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-      <Metric title="Spent this month" value={formatCurrency(spent, currency)} icon={ArrowUpRight} iconTone="peach" foot="Actual expense transactions" />
-      <Metric title="Budget remaining" value={formatCurrency(remaining, currency)} icon={Wallet} iconTone="mint" foot={remaining < 0 ? `${formatCurrency(Math.abs(remaining), currency)} above target` : "Compared with your target"} positive={remaining >= 0} />
-      <Metric title="Income recorded" value={formatCurrency(income, currency)} icon={ArrowDownLeft} iconTone="lavender" foot="Not counted against budget" positive />
-      <Metric title="Compared with last month" value={monthChange === null ? "—" : `${Math.abs(monthChange).toFixed(0)}% ${monthChange <= 0 ? "less" : "more"}`} icon={Activity} iconTone="mint" foot={monthChange === null ? "No previous month activity" : `${formatCurrency(previousMonthSpent, currency)} last month`} positive={monthChange === null || monthChange <= 0} />
-    </div>
-    <div className="mt-5 grid gap-5 xl:grid-cols-[1.3fr_.7fr]">
-      <div className="space-y-5">
-        <Card><div className="mb-5 flex items-center justify-between"><div><h2 className="font-display text-base font-bold">Overall monthly limit</h2><p className="mt-1 text-xs text-muted">The target for all expense categories</p></div><span className={`rounded-full px-2.5 py-1 text-[10px] font-semibold ${overall.percent >= 100 ? "bg-red-50 text-red-700" : overall.percent >= 80 ? "bg-amber-50 text-amber-700" : "bg-mint text-forest"}`}>{overall.percent >= 100 ? "Over limit" : overall.percent >= 80 ? "Approaching" : "On track"}</span></div>
-          <div className="mb-5"><BudgetLine title={monthTitle} spent={spent} limit={overallLimit} currency={currency} /></div>
-          <form onSubmit={(event) => void saveOverall(event)} className="flex flex-wrap gap-2 border-t border-line pt-4"><label className="min-w-[170px] flex-1 text-xs font-semibold text-muted">Set {monthTitle} target<input type="number" step="0.01" min="0.01" value={overallValue} onChange={(event) => setOverallValue(event.target.value)} placeholder={String(overallLimit)} className="mt-1.5 block w-full rounded-lg border-line text-sm text-ink" /></label><button disabled={busy} className="self-end rounded-lg bg-forest px-4 py-2.5 text-xs font-semibold text-white disabled:opacity-60">Update target</button></form>
-        </Card>
-        <Card><div className="mb-4"><h2 className="font-display text-base font-bold">Category limits</h2><p className="mt-1 text-xs text-muted">Optional targets for the areas you care about most.</p></div>
-          {categoriesWithBudgets.length ? <div className="mb-5 space-y-4">{categoriesWithBudgets.map((item) => {
-            const category = categories.find((entry) => entry.id === item.category_id);
-            const progress = budgetProgress(transactions, item, item.category_id, profile.timezone);
-            return <div key={item.id} className="flex items-start gap-3"><span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-sm" style={{ background: `${category?.color ?? "#5B9B74"}20`, color: category?.color }}>{category?.icon ?? "✦"}</span><div className="min-w-0 flex-1"><BudgetLine title={category?.name ?? "Category"} spent={progress.spent} limit={item.amount} currency={currency} /></div><button onClick={() => void removeCategoryBudget(item)} aria-label={`Remove ${category?.name ?? "category"} budget`} className="rounded-lg p-1.5 text-muted hover:bg-red-50 hover:text-red-600"><X size={15} /></button></div>;
-          })}</div> : <Empty title="No category limits yet" body="Create a focused limit for groceries, transport, or another category." />}
-          <form onSubmit={(event) => void saveCategory(event)} className="flex flex-wrap gap-2 border-t border-line pt-4"><select aria-label="Choose category for a budget" value={categoryId} onChange={(event) => setCategoryId(event.target.value)} className="min-w-[140px] flex-1 rounded-lg border-line text-xs"><option value="">Choose category</option>{categories.filter((category) => !categoriesWithBudgets.some((budget) => budget.category_id === category.id)).map((category) => <option key={category.id} value={category.id}>{category.icon} {category.name}</option>)}</select><input aria-label="Category budget amount" type="number" min="0.01" step="0.01" placeholder="Limit amount" value={categoryValue} onChange={(event) => setCategoryValue(event.target.value)} className="w-32 rounded-lg border-line text-xs" /><button disabled={busy} className="rounded-lg bg-[#edf4ee] px-3 py-2 text-xs font-semibold text-forest">Add limit</button></form>
-        </Card>
-      </div>
-      <Card><h2 className="font-display text-base font-bold">A note on budgets</h2><div className="mt-4 space-y-4 text-xs leading-5 text-muted"><p className="flex gap-2"><Check size={15} className="mt-0.5 shrink-0 text-forest" /> Spent is calculated from expense transactions recorded in this month only.</p><p className="flex gap-2"><Check size={15} className="mt-0.5 shrink-0 text-forest" /> Income is tracked separately and never reduces your spending total.</p><p className="flex gap-2"><Check size={15} className="mt-0.5 shrink-0 text-forest" /> Category spending is included in the overall total—not added on top of it.</p><p className="flex gap-2"><Check size={15} className="mt-0.5 shrink-0 text-forest" /> Your monthly target is a guide, not a judgment. Adjust it as life changes.</p></div>{error && <p role="alert" className="mt-4 rounded-lg bg-red-50 p-3 text-xs text-red-700">{error}</p>}</Card>
-    </div>
-  </>;
-}
-
 function AnalyticsPage({ transactions, categories, sources, budgets, monthlyBudget, timezone, currency }: { transactions: Transaction[]; categories: Category[]; sources: PaymentSource[]; budgets: Budget[]; monthlyBudget: number; timezone: string; currency: string }) {
   const [range, setRange] = useState("30");
   const [type, setType] = useState<TransactionType>("expense");
   const days = Number(range);
-  const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - days + 1);
-  const filtered = transactions.filter((item) => item.type === type && new Date(item.occurred_at) >= cutoff);
+  const today = dateInTimezone(new Date().toISOString(), timezone);
+  const cutoff = new Date(`${today}T00:00:00Z`);
+  cutoff.setUTCDate(cutoff.getUTCDate() - days + 1);
+  const cutoffDay = cutoff.toISOString().slice(0, 10);
+  const filtered = transactions.filter((item) => item.type === type && dateInTimezone(item.occurred_at, timezone) >= cutoffDay && dateInTimezone(item.occurred_at, timezone) <= today);
   const breakdown = categorySpending(filtered, categories, type);
-  const trend = useMemo(() => makeAnalyticsTrend(filtered, days, timezone), [filtered, days, timezone]);
+  const trend = useMemo(() => makeAnalyticsTrend(filtered, days, timezone, type), [filtered, days, timezone, type]);
   const byMethod = Object.entries(methodLabels).map(([method, label]) => ({
     label,
     amount: sumMoneyAmounts(filtered.filter((item) => item.payment_method === method).map((item) => item.amount)),
@@ -895,7 +814,7 @@ function AnalyticsPage({ transactions, categories, sources, budgets, monthlyBudg
     };
   });
   return <>
-    <PageHeading eyebrow="YOUR MONEY, UNDERSTOOD" title="Analytics" description="Patterns from your real transactions. No estimates, no filler." action={<div className="flex gap-2"><select aria-label="Analytics transaction type" value={type} onChange={(event) => setType(event.target.value as TransactionType)} className="rounded-xl border-line bg-white py-2.5 text-xs"><option value="expense">Expenses</option><option value="income">Income</option></select><select aria-label="Analytics date range" value={range} onChange={(event) => setRange(event.target.value)} className="rounded-xl border-line bg-white py-2.5 text-xs"><option value="30">Last 30 days</option><option value="90">Last 90 days</option><option value="365">Last year</option></select></div>} />
+    <PageHeading eyebrow="YOUR MONEY, UNDERSTOOD" title="Analytics" description="Patterns from your real transactions. No estimates, no filler." action={<div className="flex flex-wrap gap-2"><select aria-label="Analytics transaction type" value={type} onChange={(event) => setType(event.target.value as TransactionType)} className="rounded-xl border-line bg-white py-2.5 text-xs"><option value="expense">Expenses</option><option value="income">Income</option></select><select aria-label="Analytics date range" value={range} onChange={(event) => setRange(event.target.value)} className="rounded-xl border-line bg-white py-2.5 text-xs"><option value="30">Last 30 days</option><option value="90">Last 90 days</option><option value="365">Last year</option></select><button disabled={!filtered.length} onClick={() => downloadCsv(`spendly-${type}-report-${cutoffDay}-to-${today}.csv`, transactionReportRows(filtered, categories, sources, currency, timezone))} className="flex items-center gap-1.5 rounded-xl border border-line bg-white px-3 py-2 text-xs font-semibold text-forest disabled:opacity-40"><FileDown size={15} /> Report</button></div>} />
     <div className="grid gap-4 sm:grid-cols-3"><Metric title={`${type === "expense" ? "Expenses" : "Income"} in range`} value={formatCurrency(total, currency)} icon={type === "expense" ? ArrowUpRight : ArrowDownLeft} iconTone={type === "expense" ? "peach" : "mint"} foot={`Last ${days} days`} positive={type === "income"} /><Metric title="Transactions" value={String(filtered.length)} icon={ArrowLeftRight} iconTone="lavender" foot="In selected period" /><Metric title="Daily average" value={formatCurrency(filtered.length ? total / Math.max(1, days) : 0, currency)} icon={Activity} iconTone="mint" foot="Across the selected date range" /></div>
     {!filtered.length && <div className="mt-5"><Card><Empty title="Nothing to chart just yet" body="Add transactions in this date range and your analytics will appear here. Change the range to explore your history." /></Card></div>}
     {filtered.length > 0 && <>
@@ -1089,114 +1008,4 @@ function SharedExpenseDialog({ group, members, categories, currency, userId, clo
     {error && <p role="alert" className="rounded-lg bg-red-50 p-3 text-xs text-red-700">{error}</p>}
     <div className="flex gap-2"><button type="button" onClick={close} className="flex-1 rounded-xl border border-line py-3 text-sm font-semibold">Cancel</button><button disabled={busy} className="flex-1 rounded-xl bg-forest py-3 text-sm font-semibold text-white disabled:opacity-60">{busy ? "Saving…" : "Add expense"}</button></div>
   </form></Modal>;
-}
-
-function VaultPage({ sources, transactions, currency, userId, reload, notify }: { sources: PaymentSource[]; transactions: Transaction[]; currency: string; userId: string; reload: () => Promise<void>; notify: (message: string) => void }) {
-  const [addSource, setAddSource] = useState(false);
-  const [editing, setEditing] = useState<PaymentSource | null>(null);
-  const [showArchived, setShowArchived] = useState(false);
-  const visible = sources.filter((source) => showArchived || !source.archived);
-  const total = (id: string) => sumMoneyAmounts(transactions.filter((transaction) => transaction.payment_source_id === id && transaction.type === "expense").map((item) => item.amount));
-  return <>
-    <PageHeading eyebrow="PAYMENT TRACKING" title="Card Vault" description="Keep safe labels for the cards and UPI accounts you use." action={<button onClick={() => setAddSource(true)} className="flex items-center gap-2 rounded-xl bg-forest px-3.5 py-2.5 text-xs font-semibold text-white"><Plus size={16} /> Add payment source</button>} />
-    <div className="mb-5 flex items-start gap-3 rounded-xl border border-[#e6e9e5] bg-white px-4 py-3.5"><ShieldCheck size={17} className="mt-0.5 shrink-0 text-forest" /><p className="text-xs leading-5 text-muted"><strong className="text-ink">Safe by design:</strong> Spendly never collects full card numbers, CVVs, PINs, UPI PINs, or banking passwords. This vault is for tracking only — no payments are made.</p></div>
-    <div className="mb-4 flex justify-end"><label className="flex items-center gap-2 text-xs text-muted"><input type="checkbox" checked={showArchived} onChange={(event) => setShowArchived(event.target.checked)} className="rounded border-line text-forest focus:ring-forest" />Show archived</label></div>
-    {visible.length ? <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">{visible.map((source) => {
-      const isCard = source.kind === "credit_card" || source.kind === "debit_card";
-      return <Card key={source.id} className="relative overflow-hidden !p-5">
-        <div className="absolute -right-7 -top-9 h-32 w-32 rounded-full bg-[#edf5ef]" />
-        <div className="relative flex items-start justify-between"><div className="grid h-10 w-10 place-items-center rounded-xl bg-mint text-forest">{isCard ? <CreditCard size={19} /> : <ArrowLeftRight size={19} />}</div><div className="flex gap-1"><button onClick={() => setEditing(source)} aria-label={`Edit ${source.label}`} className="rounded-lg p-2 text-muted hover:bg-canvas"><SlidersHorizontal size={15} /></button><button onClick={async () => { if (!supabase) return; const { error } = await supabase.from("payment_sources").update({ archived: !source.archived }).eq("id", source.id); if (error) notify(error.message); else { await reload(); notify(source.archived ? "Payment source restored." : "Payment source archived."); } }} aria-label={source.archived ? `Restore ${source.label}` : `Archive ${source.label}`} className="rounded-lg p-2 text-muted hover:bg-canvas"><Ellipsis size={16} /></button></div></div>
-        <p className="relative mt-5 font-display text-base font-bold">{source.label}</p><p className="relative mt-1 text-xs text-muted">{source.kind === "upi" ? "UPI account" : `${source.issuer || "Card"} · ${source.kind === "credit_card" ? "Credit" : "Debit"}${source.last_four ? ` ···· ${source.last_four}` : ""}`}</p>{source.masked_identifier && <p className="relative mt-1 text-[10px] text-muted">{source.masked_identifier}</p>}
-        <div className="relative mt-5 flex items-end justify-between border-t border-line pt-3"><div><p className="text-[10px] text-muted">Tracked spending</p><p className="mt-1 text-sm font-semibold">{formatCurrency(total(source.id), currency)}</p></div>{source.archived && <span className="rounded-full bg-[#f1f3f1] px-2 py-1 text-[9px] font-semibold uppercase text-muted">Archived</span>}</div>
-      </Card>;
-    })}</div> : <Card><Empty title={showArchived ? "Nothing to show" : "Keep track of payment sources"} body="Add safe labels for your cards or UPI accounts. Spendly never stores sensitive payment credentials." action={<button onClick={() => setAddSource(true)} className="rounded-lg bg-forest px-3 py-2 text-xs font-semibold text-white">Add a source</button>} /></Card>}
-    {(addSource || editing) && <PaymentSourceDialog source={editing} ownerId={userId} close={() => { setAddSource(false); setEditing(null); }} saved={async () => { setAddSource(false); setEditing(null); await reload(); notify("Payment source saved."); }} />}
-  </>;
-}
-
-function PaymentSourceDialog({ source, ownerId, close, saved }: { source: PaymentSource | null; ownerId: string; close: () => void; saved: () => Promise<void> }) {
-  const [label, setLabel] = useState(source?.label ?? "");
-  const [kind, setKind] = useState<PaymentSourceKind>(source?.kind ?? "credit_card");
-  const [issuer, setIssuer] = useState(source?.issuer ?? "");
-  const [lastFour, setLastFour] = useState(source?.last_four ?? "");
-  const [masked, setMasked] = useState(source?.masked_identifier ?? "");
-  const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
-  async function submit(event: FormEvent) {
-    event.preventDefault();
-    if (!supabase || !label.trim()) { setError("Enter a nickname or display label."); return; }
-    if (lastFour && !/^\d{4}$/.test(lastFour)) { setError("Enter exactly 4 digits for the optional last-four display."); return; }
-    if (masked.length > 80) { setError("Keep the masked identifier to 80 characters or fewer."); return; }
-    setBusy(true); setError("");
-    const payload = { owner_id: ownerId, label: label.trim(), kind, issuer: kind === "upi" ? null : issuer.trim() || null, last_four: kind === "upi" ? null : lastFour || null, masked_identifier: kind === "upi" ? masked.trim() || null : null };
-    const result = source
-      ? await supabase.from("payment_sources").update(payload).eq("id", source.id)
-      : await supabase.from("payment_sources").insert(payload);
-    setBusy(false);
-    if (result.error) { setError(result.error.message); return; }
-    await saved();
-  }
-  return <Modal title={source ? "Edit payment source" : "Add payment source"} description="Only save safe display details. Never enter payment credentials." close={close}><form onSubmit={(event) => void submit(event)} className="space-y-4">
-    <Field label="Source type"><select value={kind} onChange={(event) => setKind(event.target.value as PaymentSourceKind)}><option value="credit_card">Credit card</option><option value="debit_card">Debit card</option><option value="upi">UPI account</option></select></Field>
-    <Field label={kind === "upi" ? "Display label" : "Nickname"}><input required value={label} onChange={(event) => setLabel(event.target.value)} placeholder={kind === "upi" ? "e.g. Everyday UPI" : "e.g. Travel card"} /></Field>
-    {kind !== "upi" ? <div className="grid grid-cols-2 gap-3"><Field label="Issuer (optional)"><input value={issuer} onChange={(event) => setIssuer(event.target.value)} placeholder="e.g. HDFC" /></Field><Field label="Last four digits (optional)"><input inputMode="numeric" maxLength={4} value={lastFour} onChange={(event) => setLastFour(event.target.value.replace(/\D/g, "").slice(0, 4))} placeholder="1234" /></Field></div> : <Field label="Masked UPI identifier (optional)"><input value={masked} onChange={(event) => setMasked(event.target.value)} placeholder="e.g. a••••@bank" /></Field>}
-    <p className="rounded-lg bg-[#f4f6f4] p-3 text-[10px] leading-4 text-muted">Never enter a full card number, security code, PIN, UPI PIN, or password.</p>
-    {error && <p role="alert" className="text-xs text-red-700">{error}</p>}<div className="flex gap-2"><button type="button" onClick={close} className="flex-1 rounded-xl border border-line py-3 text-sm font-semibold">Cancel</button><button disabled={busy} className="flex-1 rounded-xl bg-forest py-3 text-sm font-semibold text-white">{busy ? "Saving…" : "Save source"}</button></div>
-  </form></Modal>;
-}
-
-function SettingsPage({ profile, updateProfile, email, notify, signOut }: { profile: Profile; updateProfile: (updates: Partial<Profile>) => Promise<void>; email: string; notify: (message: string) => void; signOut: () => void }) {
-  const [name, setName] = useState(profile.display_name);
-  const [currency, setCurrency] = useState(profile.currency);
-  const [timezone, setTimezone] = useState(profile.timezone);
-  const [newPassword, setNewPassword] = useState("");
-  const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
-  async function saveProfile(event: FormEvent) {
-    event.preventDefault();
-    if (!name.trim() || !supabase) { setError("Enter your display name."); return; }
-    setBusy(true); setError("");
-    try { await updateProfile({ display_name: name.trim(), currency, timezone }); notify("Profile settings saved."); }
-    catch (caught) { setError(caught instanceof Error ? caught.message : "Settings couldn't be saved."); }
-    finally { setBusy(false); }
-  }
-  async function updatePassword(event: FormEvent) {
-    event.preventDefault();
-    if (newPassword.length < 8 || !supabase) { setError("Choose a password with at least 8 characters."); return; }
-    setBusy(true); setError("");
-    const { error: passwordError } = await supabase.auth.updateUser({ password: newPassword });
-    setBusy(false);
-    if (passwordError) { setError(passwordError.message); return; }
-    setNewPassword(""); notify("Password updated.");
-  }
-  async function deleteAccount() {
-    const confirmed = window.confirm("Delete your Spendly account permanently?\n\nThis removes your profile, transactions, budgets, categories, payment source labels, groups, shared expenses, invitations, and settlements. This action cannot be undone.");
-    if (!confirmed || !supabase) return;
-    setBusy(true); setError("");
-    const { error: deleteError } = await supabase.rpc("delete_my_account");
-    setBusy(false);
-    if (deleteError) { setError(`Your account could not be deleted: ${deleteError.message}`); return; }
-    await supabase.auth.signOut();
-    notify("Your account and Spendly data were deleted.");
-  }
-  return <>
-    <PageHeading eyebrow="MAKE IT YOURS" title="Settings" description="Your profile and the way you experience Spendly." />
-    {error && <p role="alert" className="mb-4 rounded-xl bg-red-50 p-3 text-sm text-red-700">{error}</p>}
-    <div className="grid gap-5 xl:grid-cols-[1.2fr_.8fr]">
-      <div className="space-y-5">
-        <Card><div className="mb-5"><h2 className="font-display text-base font-bold">Personal details</h2><p className="mt-1 text-xs text-muted">A few settings to make Spendly feel like yours.</p></div><form onSubmit={(event) => void saveProfile(event)} className="space-y-4">
-          <Field label="Email address"><input readOnly value={email} className="!bg-[#f6f7f5] !text-muted" /><span className="mt-1 block text-[10px] text-muted">Email changes are managed through Supabase Auth.</span></Field>
-          <Field label="Display name"><input required value={name} onChange={(event) => setName(event.target.value)} /></Field>
-          <div className="grid gap-3 sm:grid-cols-2"><Field label="Preferred currency"><select value={currency} onChange={(event) => setCurrency(event.target.value)}>{["INR", "USD", "EUR", "GBP", "CAD", "AUD", "SGD"].map((item) => <option key={item}>{item}</option>)}</select></Field><Field label="Timezone"><select value={timezone} onChange={(event) => setTimezone(event.target.value)}>{[Intl.DateTimeFormat().resolvedOptions().timeZone, "UTC", "Asia/Kolkata", "America/New_York", "Europe/London", "Asia/Singapore"].filter((value, index, list) => list.indexOf(value) === index).map((value) => <option key={value}>{value}</option>)}</select></Field></div>
-          <button disabled={busy} className="rounded-lg bg-forest px-4 py-2.5 text-xs font-semibold text-white">Save profile</button>
-        </form></Card>
-        <Card><div className="mb-4"><h2 className="font-display text-base font-bold">Password</h2><p className="mt-1 text-xs text-muted">Use a unique password with at least 8 characters.</p></div><form onSubmit={(event) => void updatePassword(event)} className="flex flex-wrap items-end gap-2"><Field label="New password"><input type="password" autoComplete="new-password" minLength={8} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} placeholder="At least 8 characters" /></Field><button disabled={busy || newPassword.length < 8} className="rounded-lg bg-[#edf4ee] px-4 py-3 text-xs font-semibold text-forest disabled:opacity-50">Update password</button></form></Card>
-        <Card><div className="flex items-start gap-3"><div className="grid h-9 w-9 place-items-center rounded-xl bg-[#f3f2eb] text-[#9b8752]"><Bell size={17} /></div><div><h2 className="text-sm font-bold">Notifications and appearance</h2><p className="mt-1 text-xs leading-5 text-muted">In-app notification preferences and theme customization aren't available yet. Spendly currently uses a calm light theme and only shows reminders inside your account.</p></div></div></Card>
-      </div>
-      <div className="space-y-5">
-        <Card><div className="mb-3 grid h-9 w-9 place-items-center rounded-xl bg-mint text-forest"><ShieldCheck size={17} /></div><h2 className="font-display text-base font-bold">Your privacy matters</h2><p className="mt-2 text-xs leading-5 text-muted">Spendly only tracks the information you enter. Transactions are private to your account, and shared details are limited to group members.</p><button onClick={signOut} className="mt-4 flex items-center gap-2 rounded-lg border border-line px-3 py-2 text-xs font-semibold text-ink hover:bg-canvas"><LogOut size={14} /> Sign out</button></Card>
-        <Card className="border-[#f0dfda]"><div className="mb-3 grid h-9 w-9 place-items-center rounded-xl bg-[#fff0eb] text-[#b7654f]"><Trash2 size={17} /></div><h2 className="font-display text-base font-bold">Delete your account</h2><p className="mt-2 text-xs leading-5 text-muted">This permanently removes your personal data and shared records. If a group has other members, the group is retained for them. Your receipts are also deleted.</p><button disabled={busy} onClick={() => void deleteAccount()} className="mt-4 rounded-lg border border-[#ecd1c9] px-3 py-2 text-xs font-semibold text-[#a44e3a] hover:bg-[#fff5f1] disabled:opacity-50">Delete account and data</button></Card>
-      </div>
-    </div>
-  </>;
 }
